@@ -1,0 +1,461 @@
+%% ========================================
+% 多智能体避碰仿真主程序 V1.3 (修改版)
+%
+% [MOD] Q1/Q4集成：增加动力学模型支持和参数注入。
+% [MOD] V1.3: 增加 FSM 状态历史记录，用于后处理可视化。
+%% ========================================
+
+clear; close all; clc; 
+addpath(genpath('.'));
+
+% 定义辅助函数 (用于兼容旧版本MATLAB)
+% 定义辅助函数 (修复版)
+if ~exist('getfieldwithdef_main','var')
+    %检查工作区是否存在这个函数句柄储存这个函数变量
+    %如果不存在就使用主函数下面定义的局部函数getfieldwithdef_legacy;
+    %@getfieldwithdef_legacy是getfieldwithdef_legacy函数的地址
+    % 通过地址可以调用这个函数
+     getfieldwithdef_main = @getfieldwithdef_legacy;
+end
+
+
+%% ------- 1. 参数设置：从配置类读取 -------
+params = SimConfigV1_2.default();
+% 新增：轨迹图像保存选项
+if ~isfield(params.viz, 'saveTrajectoryImage')
+    params.viz.saveTrajectoryImage = false;
+end
+
+
+%% ------- 2. 场景选择（UI / 场景脚本） -------
+
+fprintf('\n=== 场景加载选择 ===\n');
+fprintf('请选择场景来源：\n');
+fprintf('1. 使用 UI 场景构建器（交互式创建）\n');
+fprintf('2. 加载已保存的场景文件（.m 文件）\n');
+
+% 如果需要自动化测试，可以取消下面的注释并注释掉 input
+% choice = '2';
+choice = input('请输入选项 (1 或 2): ', 's');
+
+if strcmp(choice, '2')
+    % === 2.1 选择场景脚本 ===
+    [file, path] = uigetfile('*.m', '选择场景文件', 'Scenario/');
+    %检查 哪里存在函数uigetfile，用which+函数
+    %弹出对话框窗口，选择场景文件，Scenario/ 文件夹下的某个 .m 文件
+    if isequal(file, 0)
+        fprintf('未选择文件，退出。\n');
+        return;
+    end 
+
+    fullPath = fullfile(path, file);
+    %将场景所在的文件夹和场景脚本文件链接起来
+    fprintf('加载场景文件: %s\n', fullPath);
+
+    % 从文件名获取函数名
+    [~, funcName, ~] = fileparts(file);
+    % 文件夹路径+函数名+扩展名
+    % 添加路径并调用场景函数：约定 [agents, params] = funcName(params)
+    addpath(path);
+    try
+        [agents, params] = feval(funcName, params);
+        fprintf('成功加载场景，共 %d 个 agents\n', numel(agents));
+    catch ME
+        fprintf('加载场景文件失败: %s\n', ME.message);
+        return;
+    end
+%配置默认是simConfigV1_2来进行配置
+%注意场景脚本也可以更改配置
+else
+    % === 2.2 使用 UI 场景构建器 ===
+    params.sim.source = 'ui';
+
+    fprintf('\n=== 启动场景构建器 V1.1 版本 ===\n');
+    if exist('ScenarioBuilderV1_1', 'file')
+        [agents, params] = ScenarioBuilderV1_1(params);
+    else
+        error('找不到 ScenarioBuilderV1_1.m');
+    end
+
+    if isempty(agents)
+        fprintf('用户取消或无 agents，退出。\n');
+        return;
+    end
+end
+
+%% ------- 2.5 (Q4新增) 动力学模型参数提取 -------
+% 提取动力学参数，准备注入到Agent对象
+% 检查全局参数params中是否存在'step5'字段，Step5算法通常代表包含3-DoF动力学模型的高级版本
+if isfield(params, 'step5')
+    s5 = params.step5; % 获取Step5相关的配置子集
+    dynP = struct();   % 初始化一个空的结构体用于存放动力学参数
+    
+    % --- 航向控制 (PD控制器) 参数 ---
+    % Kp: 比例增益。决定了航向偏差修正的响应强度，值越大转舵越“狠”
+    dynP.Kp = getfieldwithdef_main(s5, 'Kp', 1.6);
+    
+    % Kd: 微分增益。起阻尼作用，防止船舶在转弯时左右大幅摆动（消除震荡）
+    dynP.Kd = getfieldwithdef_main(s5, 'Kd', 0.4);
+    
+    % --- 转向/操纵性参数 ---
+    % Kdel: 舵增益系数 (Yaw Gain)。代表舵角转换为转首角速度的效率
+    dynP.Kdel = getfieldwithdef_main(s5, 'yaw_K', 1.0);
+    
+    % Tr: 转首时间常数 (Yaw Time Constant)。数值越大，船舶转向越笨重（如货轮）；越小则越灵活
+    dynP.Tr = getfieldwithdef_main(s5, 'yaw_T', 5.0);
+    
+    % --- 速度与推进参数 ---
+    % Tu: 推进时间常数 (Surge Time Constant)。决定船舶加速到目标速度的快慢（惯性大小）
+    dynP.Tu = getfieldwithdef_main(s5, 'u_T', 15.0);
+    
+    % Dv: 横摇/漂移阻尼 (Sway Damping)。模拟船舶在水中的侧向阻力
+    dynP.Dv = getfieldwithdef_main(s5, 'v_D', 0.8);
+    
+    % Alpha: 耦合系数。描述前进速度与转弯速度之间的相互物理影响
+    dynP.Alpha = getfieldwithdef_main(s5, 'uv_alpha', 0.2);
+    
+    % --- 物理硬件/机械约束 ---
+    % deltaMax: 最大舵角限制。将角度（度）转换为弧度，通常限制在35度左右
+    dynP.deltaMax = deg2rad(getfieldwithdef_main(s5, 'delta_max_deg', 35));
+    
+    % deltaRate: 最大转舵速度。限制舵机每秒能转动的角度，防止瞬时掉头
+    dynP.deltaRate = deg2rad(getfieldwithdef_main(s5, 'delta_rate_deg', 10));
+    
+    % aMax: 最大加速度限制。船舶主机能提供的最大推力加速度
+    dynP.aMax = getfieldwithdef_main(s5, 'a_max', 1.0);
+else
+    % 如果没有启用Step5算法，则建立一个空结构体，保证后续代码引用dynP时不报错
+    dynP = struct();
+end
+
+
+%% ------- 3. 从配置类下发避碰静态参数到 Agent -------
+% 统一调用 SimConfigV1_2.applyAgentCollisionConfig
+% 避碰相关静态参数唯一真值源：params.agent
+
+% 尝试使用SimConfigV1_2来配置每一个agent
+ConfigApplied = false;
+if exist('config.SimConfigV1_2','class')
+    agents = config.SimConfigV1_2.applyAgentCollisionConfig(params, agents);
+    ConfigApplied = true;
+elseif exist('SimConfigV1_2','class')
+    agents = SimConfigV1_2.applyAgentCollisionConfig(params, agents);
+    ConfigApplied = true;
+end
+%
+if ~ConfigApplied
+    warning('未找到 SimConfig.applyAgentCollisionConfig，使用场景脚本中的 Agent 参数。');
+end
+
+% ------- 3.1 (Q1, Q4新增) 初始化路径起点和动力学模型 -------
+% 1. 获取全局动力学开关，默认为 true (如果不配置则强制开启)
+if isfield(params.sim, 'enableDynamics')
+    useDynamicsGlobal = params.sim.enableDynamics;
+else
+    % 如果配置文件里没写，也可以默认开启，或者设为 false
+    useDynamicsGlobal = true; 
+end
+%默认使用船舶动力学模型
+% 2. 检查是否有动力学参数 (dynP 在前面步骤2.5已提取)
+if useDynamicsGlobal && isempty(fieldnames(dynP))
+    warning('已开启动力学模式，但未检测到动力学参数(params.step5)，将使用默认参数或可能报错。');
+end
+
+if useDynamicsGlobal
+    fprintf('\n>>> [系统] 全局动力学模型已启用 (所有 VO 智能体将模拟船舶运动惯性)。\n');
+else
+    fprintf('\n>>> [系统] 动力学模型已关闭 (使用质点运动模型)。\n');
+end
+
+for i = 1:numel(agents)
+    % Q1: 确保 pathOrigin 初始化 (Agent构造函数已做，这里作为保障)
+    if ~isprop(agents(i), 'pathOrigin') || any(~isfinite(agents(i).pathOrigin))
+        agents(i).pathOrigin = agents(i).position;
+    end
+    %检查agent是否有路径原点属性，路径原点属性是否有效不为NaN/infinite
+
+    % Q4: 启用动力学并注入参数
+    if useDynamicsGlobal && strcmpi(agents(i).mode, 'VO') && isprop(agents(i), 'useDynamics')
+         agents(i).useDynamics = true;
+         agents(i).dynParams = dynP;
+         % 可以在此初始化初始速度u（如果需要非零启动，例如 agents(i).dynState.u = agents(i).maxSpeed;）
+    end
+end
+
+
+%% ------- 4. 打印场景信息（此时已是"下发后"的参数） -------
+
+fprintf('\n=== 场景信息 ===\n');
+fprintf('共有 %d 个 agents\n', numel(agents));
+
+for i = 1:numel(agents)
+    fprintf('Agent %d: Mode=%s', agents(i).id, agents(i).mode);
+
+    if strcmpi(agents(i).mode, 'CONST')
+        if ~isempty(agents(i).waypoints)
+            fprintf(', Waypoints=%d 个, Mode=%s', ...
+                size(agents(i).waypoints,1), agents(i).wpMode);
+        end
+    end
+
+    % Q4: 打印动力学启用状态
+    if isprop(agents(i), 'useDynamics') && agents(i).useDynamics
+        fprintf(' [Dynamics ON]');
+    end
+
+    % 打印避碰参数，方便对齐检查
+    if isprop(agents(i),'neighborDist') && isprop(agents(i),'timeHorizon') && isprop(agents(i),'safetyRadius')
+        fprintf(', neighborDist=%.2f, timeHorizon=%.2f, safetyRadius=%.2f', ...
+            agents(i).neighborDist, agents(i).timeHorizon, agents(i).safetyRadius);
+    end
+
+    fprintf('\n');
+end
+
+
+%% ------- 5. 可视化初始化 -------
+
+figure('Position', [100 100 1000 900]);
+hold on; grid on; axis equal;
+
+xlim(params.world.xlim);
+ylim(params.world.ylim);
+
+title(sprintf('%s - 多智能体避碰仿真 (V1.3 修改版)', params.algorithm.name));
+xlabel('X'); ylabel('Y');
+
+hold off;
+
+
+%% ------- 6. 轨迹记录初始化 (V1.3修改为结构体数组以记录FSM) -------
+
+% 初始化为结构体数组，准备记录位置和FSM状态
+% 我们将使用状态码来表示FSM状态: 0=Normal, 1=Observe, 2=Action
+% 注意: trajectories 从 Cell 数组变更为结构体数组
+trajectories = struct('position', cell(1, numel(agents)), ...
+                      'fsm_state_code', cell(1, numel(agents)));
+
+% 预分配空间以提高效率
+maxSteps = params.sim.maxSteps;
+for i = 1:numel(agents)
+    % 预分配位置矩阵 (初始化为 NaN)
+    trajectories(i).position = nan(maxSteps, 2);
+    % 预分配状态码向量 (使用 uint8 节省内存，初始化为 0)
+    trajectories(i).fsm_state_code = zeros(maxSteps, 1, 'uint8');
+end
+
+
+%% ------- 7. 仿真循环 -------
+
+fprintf('\n>>> 开始仿真...\n');
+
+actualSteps = 0;  % 记录实际运行的步数
+
+for step = 1:params.sim.maxSteps
+
+    actualSteps = step;  % 更新实际步数
+    % ---- 把当前步号 / 仿真时间写入 params，供避碰算法调试使用 ----
+    params.sim.step = step;                                 %调试
+    params.sim.time = step * params.sim.dt;                 %调试
+    % --- 7.1 检查 VO 智能体是否全部到达 ---
+    allReached = true;
+    for i = 1:numel(agents)
+        if strcmpi(agents(i).mode, 'VO')
+            if ~agents(i).hasReachedGoal()
+                allReached = false;
+                break;
+            end
+        end
+    end
+
+    if allReached
+        fprintf('所有 VO 智能体已到达目标！步数: %d, 时间: %.2fs\n', ...
+            step, step * params.sim.dt);
+        break;
+    end
+
+
+    % --- 7.2 邻居搜索（基于 agent.neighborDist） ---
+    for i = 1:numel(agents)
+        agents(i).findNeighbors(agents);
+    end
+
+
+    % --- 7.3 速度规划 ---
+    for i = 1:numel(agents)
+
+        % 已到达：直接置 0 速
+        if agents(i).hasReachedGoal()
+            % Q4: 如果使用动力学，设置目标速度为0，动力学模型会处理减速
+            agents(i).velocity = [0, 0];
+            continue;
+        end
+
+        % 先算期望速度：
+        %   - CONST：按 waypoints / constVel
+        %   - VO   ：朝向 goal 的最大速度方向
+        agents(i).computePreferredVelocity();
+
+        if strcmpi(agents(i).mode,'CONST')
+            % CONST 模式：直接用期望速度（已考虑 waypoint），再做一次限幅
+            v = agents(i).prefVelocity;
+            s = norm(v);
+            vmax = agents(i).maxSpeed;
+
+            if s > vmax && s > 1e-6
+                v = v * (vmax / s);
+            end
+
+            agents(i).velocity = v;
+
+        else
+            % VO 模式：统一算法入口
+            % Q4: VO算法输出的是期望速度/航向，存入velocity等待动力学模块执行
+            agents(i).velocity = algorithms.computeVelocity( ...
+                agents(i), agents(i).neighbors, params);
+        end
+    end
+
+
+    % --- 7.4 位置更新 + 轨迹记录 + FSM状态记录 (V1.3修改) ---
+    for i = 1:numel(agents)
+        % Q4集成：调用updatePosition。Agent内部会处理动力学或运动学更新。
+        agents(i).updatePosition(params.sim.dt, params);
+
+        % 记录位置 (使用 step 作为索引)
+        trajectories(i).position(step, :) = agents(i).position;
+
+        % 记录 FSM 状态
+        % 定义状态码: 0=Normal, 1=Observe, 2=Action
+        statusCode = uint8(0);%状态编码，初始化为0
+        if isprop(agents(i), 'debugInfo') && ~isempty(agents(i).debugInfo)
+            % 优先判断 Observe 状态 (fsm_observe_ids 非空)
+            if isfield(agents(i).debugInfo, 'fsm_observe_ids') && ~isempty(agents(i).debugInfo.fsm_observe_ids)
+                statusCode = uint8(1); % Observe
+            % 再判断 Action 状态 (fsm_mode > 0)
+            elseif isfield(agents(i).debugInfo, 'fsm_mode') && agents(i).debugInfo.fsm_mode > 0
+                statusCode = uint8(2); % Action
+            end
+        end
+        trajectories(i).fsm_state_code(step) = statusCode;
+    end
+
+
+    % --- 7.5 可视化更新 ---
+    if mod(step, params.viz.updateInterval) == 0
+        cla; hold on;
+
+        % [V1.3 修改] 兼容性处理：plotAgentsV1_1 期望 Cell 数组来绘制实时轨迹。
+        % 我们需要临时生成一个 Cell 数组传递给它。
+        
+        % 临时生成当前步的 Cell 轨迹数据用于实时绘图
+        tempCellTrajectories = cell(1, numel(agents));
+        for k_traj = 1:numel(agents)
+             % 提取到当前步为止的有效数据
+             validPos = trajectories(k_traj).position(1:step, :);
+             tempCellTrajectories{k_traj} = validPos;
+        end
+    %画图函数只能接受元胞的数据格式，以上部分相当于把结构体数据转化为元胞数据
+        plotAgentsV1_1(agents, tempCellTrajectories, ...
+            params.viz.showVelocity, ...
+            params.viz.showGoals, ...
+            params.viz.showSafetyCircle, ...
+            params.viz.showSpeedValue, ...
+            params.agent.safetyRadius, ...
+            params);
+
+        xlim(params.world.xlim);
+        ylim(params.world.ylim);
+        grid on; axis equal;
+
+        title(sprintf('%s | step=%d | t=%.2fs', ...
+            params.algorithm.name, step, step * params.sim.dt));
+        xlabel('X'); ylabel('Y');
+
+        hold off;
+        drawnow;
+        pause(params.viz.pauseTime);
+    end
+
+
+    % --- 7.6 进度输出 ---
+    if mod(step, 100) == 0
+        fprintf(' 进度: %d / %d (t=%.2fs)\n', ...
+            step, params.sim.maxSteps, step * params.sim.dt);
+    end
+end
+
+% [V1.3 新增] 仿真结束后，清理 trajectories 中未使用的预分配空间
+if actualSteps < maxSteps
+    for i = 1:numel(agents)
+        trajectories(i).position = trajectories(i).position(1:actualSteps, :);
+        trajectories(i).fsm_state_code = trajectories(i).fsm_state_code(1:actualSteps);
+    end
+end
+
+fprintf('>>> 仿真完成。\n\n');
+
+
+%% ------- 8. 统计信息 -------
+% ... (此部分无变化) ...
+fprintf('=== 仿真统计 ===\n');
+for i = 1:numel(agents)
+    fprintf('Agent %d (%s): ', agents(i).id, agents(i).mode);
+
+    if strcmpi(agents(i).mode,'CONST') && ~isempty(agents(i).waypoints)
+        fprintf('完成了 waypoint 路径巡航');
+        if strcmpi(agents(i).wpMode,'loop')
+            fprintf('（循环模式）');
+        elseif strcmpi(agents(i).wpMode,'pingpong')
+            fprintf('（往返模式）');
+        end
+    else
+        dist = norm(agents(i).position - agents(i).goal);
+        fprintf('距目标 %.2f 米', dist);
+    end
+
+    fprintf('\n');
+end
+
+
+%% ------- 9. 轨迹后处理可视化（新增） -------
+
+fprintf('\n=== 生成轨迹总览图 ===\n');
+
+% 检查函数是否存在
+if ~exist('plotFinalTrajectories', 'file')
+    warning('未找到 plotFinalTrajectories 函数，请确保该文件在路径中。');
+    fprintf('跳过轨迹后处理可视化。\n');
+else
+    % 调用新的轨迹可视化函数
+    % 注意：此时传入的 trajectories 是结构体数组
+    try
+        plotFinalTrajectories(agents, trajectories, params, actualSteps);
+        fprintf('轨迹可视化完成。\n');
+    catch ME
+        warning(ME.identifier, 'plotFinalTrajectories 执行失败: %s', ME.message);
+        % 打印堆栈信息帮助调试
+        disp(ME.stack(1));
+    end
+end
+
+% 询问用户是否保存轨迹数据
+saveChoice = input('\n是否保存轨迹数据到文件？(y/n): ', 's');
+
+if strcmpi(saveChoice, 'y')
+    filename = sprintf('trajectory_data_%s_%s.mat', ...
+        params.algorithm.name, datestr(now, 'yyyymmdd_HHMMSS'));
+    save(filename, 'agents', 'trajectories', 'params', 'actualSteps');
+    fprintf('轨迹数据已保存到: %s\n', filename);
+end
+
+fprintf('\n>>> 全部任务完成。\n');
+
+% 辅助函数定义（兼容旧版本MATLAB）
+function val = getfieldwithdef_legacy(s, name, def)
+    if isfield(s, name)
+        val = s.(name);
+    else
+        val = def;
+    end
+end
